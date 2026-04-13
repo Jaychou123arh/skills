@@ -24,7 +24,7 @@ KEYWORD_MODULE_MAP = {
     "现金流量表": ["模块2", "模块3"],
     "所有者权益变动表": ["模块2"], # 明确所有者权益变动表
     "财务报表附注": ["模块4", "模块7", "模块9"],
-    "管理层讨论与分析": ["模块3", "模块5", "模块6"],
+    "管理层讨论与分析": ["模块3", "模块5", " অত্যা", "模块6"], # 修正此处，将“模块6”也关联上
     "风险提示": ["模块4", "模块9"],
     "重大事项": ["模块1", "模块7", "模块9"], # 使用“重大事项”保持一致
     "公司治理": ["模块1", "模块8"],
@@ -121,7 +121,8 @@ def generate_audit_index_from_pdf(pdf_path: str) -> str:
                                         key_chapter_locations[key_chapter_name] = page_num
                                     break # 找到一个匹配即可
     except Exception as e:
-        return f"处理PDF时发生错误: {e}"
+        # 如果发生异常，返回一个包含错误信息的JSON字符串
+        return json.dumps({"error": f"处理PDF时发生错误: {e}"}, ensure_ascii=False, indent=4)
 
     # --- 构建最终的报告字符串 ---
     report_output = ["【模块化可执行审核索引表】\n"]
@@ -223,4 +224,5 @@ def generate_audit_index_from_pdf(pdf_path: str) -> str:
     report_output.append("\n该索引表已足够具体，后续审核模块可直接据此执行相应的审核任务。")
 
 
+    # 将最终的 Markdown 报告字符串返回
     return "\n".join(report_output)
