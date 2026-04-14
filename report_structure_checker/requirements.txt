@@ -1,0 +1,8 @@
+---
+
+### **`report_structure_checker/requirements.txt`**
+
+```text
+pdfplumber
+re
+json
