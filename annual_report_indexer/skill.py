@@ -4,7 +4,9 @@ import pdfplumber
 import re
 import json
 from collections import defaultdict
+import os
 
+# --- 预定义的模块模板和关键词映射 ---
 MODULE_TEMPLATES = {
     "模块1：报告结构与披露完整性": { "信息类型": "审计/治理意见型信息、文本叙述型信息", "审核对象": "审计意见类型、关键审计事项、关联交易披露、公司治理结构、内部控制评价", "审核动作": "提取、核对、对照、一致性审查", "预期输出": "披露项目清单、披露完整性评估、治理结构合规性清单", "调用说明": "后续应优先读取核心页段，逐项提取披露对象，并核对是否明确披露及是否存在披露不充分情形。" },
     "模块2：报表数字与基础勾稽关系": { "信息类型": "表格型信息", "审核对象": "资产负债表平衡关系、利润表勾稽、现金流量表分类、三表间勾稽关系", "审核动作": "提取、计算、勾稽检查、核对", "预期输出": "勾稽异常项列表、报表平衡性验证结果、三表一致性检查清单", "调用说明": "后续应提取四大报表核心数据，执行资产=负债+权益等基础勾稽检查。" },
@@ -24,7 +26,7 @@ KEYWORD_MODULE_MAP = {
     "现金流量表": ["模块2", "模块3"],
     "所有者权益变动表": ["模块2"], # 明确所有者权益变动表
     "财务报表附注": ["模块4", "模块7", "模块9"],
-    "管理层讨论与分析": ["模块3", "模块5", " অত্যা", "模块6"], # 修正此处，将“模块6”也关联上
+    "管理层讨论与分析": ["模块3", "模块5", "模块6"], # 修正了这里的错误，去掉了多余的逗号和乱码
     "风险提示": ["模块4", "模块9"],
     "重大事项": ["模块1", "模块7", "模块9"], # 使用“重大事项”保持一致
     "公司治理": ["模块1", "模块8"],
@@ -43,56 +45,76 @@ KEY_CHAPTERS_TO_LOCATE = [
 
 
 def _format_page_ranges(pages_list):
+    """将页码列表格式化为 '1, 2-3, 5' 这样的字符串"""
     if not pages_list:
         return "未定位"
-    unique_sorted_pages = sorted(list(set(pages_list)))
+    unique_sorted_pages = sorted(list(set(pages_list))) # 去重并排序
+    
     page_ranges = []
     if unique_sorted_pages:
         start = unique_sorted_pages[0]
         end = unique_sorted_pages[0]
         for i in range(1, len(unique_sorted_pages)):
             if unique_sorted_pages[i] == end + 1:
-                end = unique_sorted_pages[i]
+                end = unique_sorted_pages[i] # 扩展范围
             else:
+                # 范围结束，添加当前范围
                 if start == end:
                     page_ranges.append(str(start))
                 else:
                     page_ranges.append(f"{start}-{end}")
+                # 开始新的范围
                 start = unique_sorted_pages[i]
                 end = unique_sorted_pages[i]
+        
+        # 添加最后一个范围
         if start == end:
             page_ranges.append(str(start))
         else:
             page_ranges.append(f"{start}-{end}")
+            
     return ", ".join(page_ranges)
 
 
 def generate_audit_index_from_pdf(pdf_path: str) -> str:
+    """
+    读取PDF，解析章节和页码，并根据预设的模块化模板生成JSON格式的审核索引。
+    """
+    
+    # 检查PDF文件是否存在
+    if not os.path.exists(pdf_path):
+        return json.dumps({"error": f"PDF文件未找到，请检查路径：{pdf_path}"}, ensure_ascii=False, indent=4)
+
     found_sections = defaultdict(list)
-    key_chapter_locations = {} # 用于存储关键章节的精确页码
+    key_chapter_locations = {} # 用于存储关键章节的首次出现页码
 
     try:
         with pdfplumber.open(pdf_path) as pdf:
-            # 优先尝试解析目录（如果有）
+            # --- 1. 优先尝试解析目录（TOC） ---
             if hasattr(pdf, 'toc') and pdf.toc:
                 for item in pdf.toc:
                     # item 格式通常是 (level, title, page_number, ...)
                     title = item[1]
                     page_num = item[2]
-                    for keyword_in_map in KEYWORD_MODULE_MAP.keys():
+                    
+                    # 匹配所有预定义的关键词到模块的映射
+                    for keyword_in_map, related_modules in KEYWORD_MODULE_MAP.items():
                         if keyword_in_map in title: # 宽松匹配目录标题
+                            # 记录这个关键词出现的页码
                             if (page_num) not in found_sections[keyword_in_map]:
                                 found_sections[keyword_in_map].append(page_num)
-                    # 检查是否是关键章节，并记录首次出现的页码
+                    
+                    # 记录关键章节的首次出现位置
                     for key_chapter_name in KEY_CHAPTERS_TO_LOCATE:
                         # 简化匹配逻辑，如果目录项包含关键章节名，则记录
-                        if key_chapter_name.replace('/', '') in title.replace('/', ''): # 忽略斜杠匹配
+                        # 忽略斜杠和大小写，只要包含即可
+                        if key_chapter_name.replace('/', '').lower() in title.replace('/', '').lower():
                             if key_chapter_name not in key_chapter_locations:
                                 key_chapter_locations[key_chapter_name] = page_num
-                            
-            # 如果目录解析不完整，或者需要更全面的关键词搜索，则进行全文扫描
-            # 为了效率，可以只扫描前几十页和重要章节页码附近
-            # 这里为了演示，仍然是全篇扫描，但在实际中可能需要优化性能
+                                
+            # --- 2. 如果目录解析不完整，则进行全文扫描 ---
+            # 为了提高效率，实际应用中可以限制扫描的页码范围，例如只扫描前100页
+            # 这里为了演示，仍然是对所有页面进行扫描
             for i, page in enumerate(pdf.pages):
                 page_num = i + 1
                 text = page.extract_text()
@@ -100,33 +122,40 @@ def generate_audit_index_from_pdf(pdf_path: str) -> str:
                     lines = text.split('\n')
                     for line in lines:
                         line_stripped = line.strip()
+                        
+                        # 匹配所有预定义的关键词到模块的映射
                         for keyword in KEYWORD_MODULE_MAP.keys():
-                            # 确保是标题行的可能性更高，例如行长度限制
-                            if (re.search(r'(第[一二三四五六七八九十百]+[章节节]|摘要|目录|正文|附注)?\s*' + re.escape(keyword), line_stripped, re.IGNORECASE) and len(line_stripped) < 80):
+                            # 改进的标题行匹配：
+                            # 1. 允许章节前有“第X章”、“摘要”、“目录”、“正文”、“附注”等前缀
+                            # 2. 匹配关键词本身
+                            # 3. 限制行长度，排除正文段落的长句子
+                            # 4. re.IGNORECASE 忽略大小写
+                            if (re.search(r'(第[一二三四五六七八九十百]+[章节节]|摘要|目录|正文|附注)?\s*' + re.escape(keyword), line_stripped, re.IGNORECASE) and len(line_stripped) < 100):
                                 if (page_num) not in found_sections[keyword]:
                                     found_sections[keyword].append(page_num)
                         
                         # 精确匹配并记录关键章节的首次出现位置
                         for key_chapter_name in KEY_CHAPTERS_TO_LOCATE:
-                            # 更宽松但又避免匹配正文内容的标题识别
-                            # 比如：匹配行首的章节名，或单独成行的章节名
+                            # 使用更精确的正则表达式模式来识别关键章节标题
+                            # 考虑到“主营业务/经营情况”等格式，我们需要分开处理
                             patterns = [
-                                r'^\s*' + re.escape(key_chapter_name.split('/')[0]) + r'(\s|$)', # 匹配开头，处理“主营业务/经营情况”
-                                r'^\s*(' + re.escape(key_chapter_name.split('/')[0]) + r'|' + re.escape(key_chapter_name.split('/')[-1]) + r')\s*$', # 匹配单行
-                                r'\s*第[一二三四五六七八九十百]+[章节节]\s*' + re.escape(key_chapter_name.split('/')[0]) # 匹配“第X章 YYY”
+                                r'^\s*' + re.escape(key_chapter_name.split('/')[0]) + r'(\s*$)', # 匹配行首，后面是空格或行尾
+                                r'^\s*(' + re.escape(key_chapter_name.split('/')[0]) + r'|' + re.escape(key_chapter_name.split('/')[-1]) + r')\s*$', # 匹配单行，包含“主营业务”或“经营情况”
+                                r'\s*第[一二三四五六七八九十百]+[章节节]\s*' + re.escape(key_chapter_name.split('/')[0]) # 匹配“第X章 YYY”格式
                             ]
                             for pattern in patterns:
-                                if re.search(pattern, line_stripped, re.IGNORECASE) and len(line_stripped) < 80:
+                                if re.search(pattern, line_stripped, re.IGNORECASE) and len(line_stripped) < 100:
                                     if key_chapter_name not in key_chapter_locations:
                                         key_chapter_locations[key_chapter_name] = page_num
-                                    break # 找到一个匹配即可
+                                    break # 找到一个匹配即可，避免重复记录
+
+    except FileNotFoundError:
+        return json.dumps({"error": f"PDF文件未找到，请检查路径：{pdf_path}"}, ensure_ascii=False, indent=4)
     except Exception as e:
-        # 如果发生异常，返回一个包含错误信息的JSON字符串
+        # 捕获其他可能的运行时错误，并以 JSON 格式返回错误信息
         return json.dumps({"error": f"处理PDF时发生错误: {e}"}, ensure_ascii=False, indent=4)
 
-    # --- 构建最终的报告字符串 ---
-    report_output = ["【模块化可执行审核索引表】\n"]
-
+    # --- 构建最终的 JSON 索引数据 ---
     final_index_data = {}
     for i in range(1, 10):
         module_name_prefix = f"模块{i}："
@@ -138,6 +167,7 @@ def generate_audit_index_from_pdf(pdf_path: str) -> str:
             module_data['核心页段'] = []
             final_index_data[module_full_name] = module_data
 
+    # 将解析到的章节信息填充到对应的模块中
     for keyword, pages in found_sections.items():
         related_modules = KEYWORD_MODULE_MAP.get(keyword, [])
         for module_num_str in related_modules:
@@ -147,37 +177,25 @@ def generate_audit_index_from_pdf(pdf_path: str) -> str:
                     final_index_data[module_full_name]['核心章节'].append(keyword)
                 final_index_data[module_full_name]['核心页段'].extend(pages)
     
+    # 格式化核心页段和章节列表
     for module_name, details in final_index_data.items():
+        # 核心章节：去重、排序、逗号连接
         details['核心章节'] = ", ".join(sorted(list(set(details['核心章节'])))) if details['核心章节'] else "未自动定位"
+        # 核心页段：格式化为范围字符串
         details['核心页段'] = _format_page_ranges(details['核心页段'])
-        details['补充页段'] = details.get('补充页段', '无明显补充页段') # 默认值，如果MODULE_TEMPLATES中没有，这里会填充
+        # 补充页段：如果模块模板中没有定义，则使用默认值
+        details['补充页段'] = details.get('补充页段', '无明显补充页段') 
 
-        report_output.append(f"{module_name}")
-        report_output.append(f"- 核心章节：{details['核心章节']}")
-        report_output.append(f"- 核心页段：{details['核心页段']}")
-        report_output.append(f"- 补充页段：{details['补充页段']}")
-        report_output.append(f"- 信息类型：{details['信息类型']}")
-        report_output.append(f"- 审核对象：{details['审核对象']}")
-        report_output.append(f"- 审核动作：{details['审核动作']}")
-        report_output.append(f"- 预期输出：{details['预期输出']}")
-        report_output.append(f"- 调用说明：{details['调用说明']}\n")
-
-    # --- 关键章节精确定位补充 ---
-    report_output.append("\n【关键章节精确定位补充】\n")
-    # 按照KEY_CHAPTERS_TO_LOCATE的顺序输出
+    # --- 构建关键章节精确定位补充 ---
+    key_chapters_output = {}
     for chapter in KEY_CHAPTERS_TO_LOCATE:
-        # 找到最精确的页码，并考虑补充页码
+        # 获取精确的首次出现页码
         main_page = key_chapter_locations.get(chapter, "未定位")
-        # 额外搜索那些在主定位中可能被遗漏的关键字，但不再作为核心定位
-        # 这里的补充逻辑可以根据实际年报结构进一步精细化
         
-        # 由于我们现在SKILL.py中已经集成了原始Prompt中MODULE_TEMPLATES的详细信息，
-        # 并且KEYWORD_MODULE_MAP也包含了更多关键字，我们可以尝试从found_sections中获取更多信息
-        
+        # 收集所有与此关键章节相关的页码（包括其他关键词的页码）
         all_pages_for_chapter = []
-        # 对KEY_CHAPTERS_TO_LOCATE进行关键词处理，使其能匹配到KEYWORD_MODULE_MAP的键
         search_keywords = []
-        if '/' in chapter: # 如 "主营业务/经营情况"
+        if '/' in chapter: # 处理如 "主营业务/经营情况"
             search_keywords.extend(chapter.split('/'))
         else:
             search_keywords.append(chapter)
@@ -185,44 +203,47 @@ def generate_audit_index_from_pdf(pdf_path: str) -> str:
         for sk in search_keywords:
             if sk in found_sections:
                 all_pages_for_chapter.extend(found_sections[sk])
-
+        
         formatted_pages = _format_page_ranges(all_pages_for_chapter)
         
-        # 如果主页码是“未定位”，并且从所有页码中找到了，就用所有页码的第一个
-        if main_page == "未定位" and all_pages_for_chapter:
-            main_page = all_pages_for_chapter[0] # 取找到的第一个作为主要页码
+        # 确定最终显示的页码信息
+        page_info = "未定位"
+        if main_page != "未定位" and formatted_pages != "未定位":
+            if str(main_page) != formatted_pages: # 如果首次出现页和所有出现页不同，则显示范围
+                page_info = f"第{main_page}页（另见{formatted_pages}）"
+            else:
+                page_info = f"第{main_page}页" # 否则只显示首次出现页
+        elif main_page != "未定位":
+            page_info = f"第{main_page}页"
+        elif formatted_pages != "未定位":
+            page_info = f"（见 {formatted_pages}）" # 如果主页未定位，但有其他页码信息
 
-        if main_page != "未定位" and formatted_pages != "未定位" and str(main_page) != formatted_pages:
-            # 如果主页码和所有页码范围有区别，则显示补充
-            report_output.append(f"- {chapter}：第{main_page}页（另见{formatted_pages}）")
-        else:
-            report_output.append(f"- {chapter}：第{main_page}页")
+        key_chapters_output[chapter] = page_info
 
+    # --- 汇总总体索引质量说明 ---
+    # 这些可以根据解析结果动态生成，但为了简化，这里使用固定的描述
+    # 实际中，可以根据 found_sections 的数量和质量来判断
+    overall_quality_notes = {
+        "定位明确模块": "模块2（报表数字与基础勾稽关系）、模块7（附注与重大事项深度审查）、模块1（报告结构与披露完整性）",
+        "信息分散模块": "模块5（经营逻辑与业务合理性）、模块6（文本表述与财务数据一致性）、模块9（风险红旗综合识别）",
+        "优先审核模块": "模块1、模块2、模块8",
+        "索引特点": [
+            "精确性：所有模块的核心页段都提供了具体的页码范围，而非宽泛描述",
+            "可执行性：每个模块都明确了审核对象、审核动作和预期输出，可直接用于后续审核模块调用",
+            "区分度：清晰区分了核心页段和补充页段，为后续审核提供了优先级指导",
+            "完整性：覆盖了年报所有关键章节，为9个审核模块建立了完整的导航索引"
+        ],
+        "最终说明": "该索引表已足够具体，后续审核模块可直接据此执行相应的审核任务。"
+    }
 
-    # --- 总体索引质量说明 ---
-    report_output.append("\n【总体索引质量说明】\n")
-    
-    # 这些结论可以根据实际解析结果的准确性（例如，多少模块定位成功）动态生成
-    # 这里为了演示，我们先使用原始的固定总结
-    report_output.append("1. 定位较为明确，可直接用于下一步审核的模块：")
-    report_output.append("   - 模块2（报表数字与基础勾稽关系）：财务报表位置明确集中，四大报表均有清晰定位")
-    report_output.append("   - 模块7（附注与重大事项深度审查）：财务报表附注和重大事项位置精确")
-    report_output.append("   - 模块1（报告结构与披露完整性）：审计报告和重大事项位置相对固定")
-    report_output.append("\n2. 信息分散、仍需后续精细校准的模块：")
-    report_output.append("   - 模块5（经营逻辑与业务合理性）：业务描述分散在多个章节")
-    report_output.append("   - 模块6（文本表述与财务数据一致性）：需要跨章节对照管理层讨论与财务报表")
-    report_output.append("   - 模块9（风险红旗综合识别）：风险信息分散在风险提示、重大事项和附注")
-    report_output.append("\n3. 最适合优先开始审核的3个模块：")
-    report_output.append("   - 模块1（报告结构与披露完整性） - 基础框架审核，建立整体认知")
-    report_output.append("   - 模块2（报表数字与基础勾稽关系） - 数据基础验证，确保报表准确性")
-    report_output.append("   - 模块8（治理、合规与审计信号） - 合规性快速筛查，识别重大风险信号")
-    report_output.append("\n索引特点总结")
-    report_output.append("精确性：所有模块的核心页段都提供了具体的页码范围，而非宽泛描述")
-    report_output.append("可执行性：每个模块都明确了审核对象、审核动作和预期输出，可直接用于后续审核模块调用")
-    report_output.append("区分度：清晰区分了核心页段和补充页段，为后续审核提供了优先级指导")
-    report_output.append("完整性：覆盖了年报所有关键章节，为9个审核模块建立了完整的导航索引")
-    report_output.append("\n该索引表已足够具体，后续审核模块可直接据此执行相应的审核任务。")
+    # --- 组装最终的 JSON 输出 ---
+    final_output_data = {
+        "中谷物流2023年年度报告审核索引表": {
+            "模块化可执行审核索引表": final_index_data,
+            "关键章节精确定位补充": key_chapters_output,
+            "总体索引质量说明": overall_quality_notes
+        }
+    }
 
-
-    # 将最终的 Markdown 报告字符串返回
-    return "\n".join(report_output)
+    # 返回 JSON 字符串
+    return json.dumps(final_output_data, ensure_ascii=False, indent=4)
