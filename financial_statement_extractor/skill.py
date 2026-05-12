@@ -4,9 +4,22 @@ import os
 import re
 
 
-# ===============================
-# 数值清洗
-# ===============================
+# 所有报表标题（用于边界检测）
+ALL_STATEMENT_TITLES = [
+    "合并资产负债表",
+    "母公司资产负债表",
+    "合并利润表",
+    "母公司利润表",
+    "合并现金流量表",
+    "母公司现金流量表",
+    "合并所有者权益变动表",
+    "母公司所有者权益变动表"
+]
+
+
+# ==========================
+# 工具函数
+# ==========================
 
 def _clean_number(value):
     if not value:
@@ -25,19 +38,46 @@ def _is_number(text):
     return bool(re.fullmatch(r"-?\d+(\.\d+)?", text))
 
 
-# ===============================
-# 解析单张报表（完整逐行抽取）
-# ===============================
+def _page_contains_title(page, statement_name):
+    text = page.extract_text() or ""
+    lines = text.split("\n")[:20]
+    return any(statement_name in line for line in lines)
 
-def _parse_statement(pdf, start_page, end_page):
+
+def _page_contains_other_title(page, current_title):
+    text = page.extract_text() or ""
+    lines = text.split("\n")[:20]
+    for title in ALL_STATEMENT_TITLES:
+        if title != current_title:
+            if any(title in line for line in lines):
+                return True
+    return False
+
+
+# ==========================
+# 核心解析逻辑（标题驱动）
+# ==========================
+
+def _parse_statement(pdf, statement_name, start_page, end_page):
 
     result = {}
     unit = "未知"
+    started = False
 
     for page_index in range(start_page - 1, end_page):
         page = pdf.pages[page_index]
-
         text = page.extract_text() or ""
+
+        # 如果还没开始，必须遇到标题才开始
+        if not started:
+            if _page_contains_title(page, statement_name):
+                started = True
+            else:
+                continue
+
+        # 如果已经开始，遇到其他报表标题则停止
+        if started and _page_contains_other_title(page, statement_name):
+            break
 
         # 提取单位
         if "单位" in text:
@@ -60,7 +100,7 @@ def _parse_statement(pdf, start_page, end_page):
                 if not item_name:
                     continue
 
-                if len(item_name) > 50:
+                if len(item_name) > 60:
                     continue
 
                 numbers = [cell for cell in row[1:] if _is_number(cell)]
@@ -83,9 +123,9 @@ def _parse_statement(pdf, start_page, end_page):
     }
 
 
-# ===============================
-# 主函数（严格依赖技能1）
-# ===============================
+# ==========================
+# 主函数
+# ==========================
 
 def extract_full_financial_statements(pdf_path: str, financial_structure: dict) -> str:
 
@@ -93,7 +133,7 @@ def extract_full_financial_statements(pdf_path: str, financial_structure: dict) 
         return json.dumps({"error": "文件不存在"}, ensure_ascii=False)
 
     if not financial_structure:
-        return json.dumps({"error": "未提供财务报表结构数据"}, ensure_ascii=False)
+        return json.dumps({"error": "未提供财务报表结构"}, ensure_ascii=False)
 
     results = {}
 
@@ -110,6 +150,7 @@ def extract_full_financial_statements(pdf_path: str, financial_structure: dict) 
 
                 parsed = _parse_statement(
                     pdf,
+                    statement_name,
                     start_page,
                     end_page
                 )
